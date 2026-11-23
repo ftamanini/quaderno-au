@@ -1,0 +1,30 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Autorizzato = ha fatto l'accesso E ha un documento in "allenatori" con il suo UID come ID.
+    // Chi si registra da solo non ha quel documento, quindi non legge e non scrive nulla.
+    function autorizzato() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/allenatori/$(request.auth.uid));
+    }
+
+    // Elenco degli allenatori: si modifica solo dalla console.
+    // Ognuno può solo controllare se c'è il proprio documento (serve all'app per dire "non autorizzato").
+    match /allenatori/{uid} {
+      allow get: if request.auth != null && request.auth.uid == uid;
+      allow list, create, update, delete: if false;
+    }
+
+    // Dati dell'app, condivisi tra gli allenatori autorizzati
+    match /exercises/{id} { allow read, write: if autorizzato(); }
+    match /plays/{id}     { allow read, write: if autorizzato(); }
+    match /log/{id}       { allow read, write: if autorizzato(); }
+    match /config/{id} {
+      allow read: if autorizzato();
+      allow write: if autorizzato() && id in ['taxonomy', 'backup'];
+    }
+
+    // Tutto il resto è chiuso.
+  }
+}
