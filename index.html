@@ -736,6 +736,7 @@ body.gated .tabbar,body.gated .fab{visibility:hidden}
 .pwform{display:flex;flex-direction:column;gap:16px}
 /* etichetta della versione di prova: un bollino al posto della riga piccola sopra al titolo (con il logo non c'è spazio per entrambe) */
 .topbar h1 small{font-size:0;letter-spacing:0;line-height:1;margin-bottom:5px}
+body.preview .topbar h1 small::after{content:"Anteprima";background:#161616;color:#FDDD10;box-shadow:inset 0 0 0 1px #FDDD10}
 .topbar h1 small::after{content:"Versione di prova";display:inline-block;margin-left:0;padding:3px 6px;border-radius:4px;font:600 10.5px/1 var(--f-display);letter-spacing:.12em;text-transform:uppercase;color:var(--hi-ink);background:var(--hi)}
 </style>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
@@ -1013,7 +1014,7 @@ const Store=(()=>{
     if(cache&&cache.items) ready=true;
     recompute(); emit("data");
     let d=null;
-    try{ d=Cloud.db(); if(d){ conn="connecting"; emit("status") } }catch{d=null}
+    try{ conn="connecting"; emit("status"); d=await Cloud.db() }catch{d=null}
     if(!d){ conn="offline"; ready=true; recompute(); emit("data"); return }
     db=d; try{ subscribe() }catch{ conn="offline"; ready=true; emit("data") }
     const again=()=>{ if(document.visibilityState!=="hidden"){ backoff=0; nextTryAt=0; kick(0) } };
@@ -2129,6 +2130,10 @@ async function doExport(){
   try{
     const payload={app:"quaderno-tecnico-rugby",edition:"test",schema:2,exportedAt:new Date().toISOString(),count:Store.items.length,exercises:Store.items,taxonomy:TAX,log:Store.logs,plays:Store.plays};
     const text=JSON.stringify(payload,null,1), name=backupName();
+    if(Cloud.preview){ let dl=null; try{ dl=await window.claude.use("downloads") }catch{dl=null}
+      if(dl){ try{ await dl.save({filename:name,data:text}); Store.setBackupAt(Date.now()); toast("Backup salvato","check"); return }
+        catch(e){ const c=e&&e.code; if(c==="declined"){ toast("Backup annullato","close"); return } if(c==="rate_limited"){ toast("C'è già una richiesta aperta: riprova tra poco","close"); return } } }
+      openCopySheet(text); return }
     /* iPhone (e Android): foglio di condivisione → «Salva in File», AirDrop, Mail… (va chiamato subito dopo il tocco) */
     let file=null; try{ file=new File([text],name,{type:"application/json"}) }catch{}
     if(file&&navigator.canShare&&navigator.share){ let can=false; try{ can=navigator.canShare({files:[file]}) }catch{}
@@ -2198,6 +2203,10 @@ function readImport(file){
    e Firestore con le stesse raccolte di prima: exercises, plays, log, config.
    Chi può leggere e scrivere lo decidono le regole di Firestore: solo chi ha un documento in "allenatori". */
 const Cloud=(()=>{
+  /* ANTEPRIMA: dentro Claude (artifact) l'app non usa mai Firebase e non tocca i dati degli allenatori:
+     niente accesso, i dati sono quelli dell'archivio dell'artifact. Su github.io non è mai anteprima. */
+  const inClaude=()=>!!(window.claude&&typeof window.claude.use==="function")&&!/\.github\.io$/i.test(location.hostname);
+  let PREVIEW=false;
   const cfg=(typeof firebaseConfig!=="undefined"&&firebaseConfig)||window.FIREBASE_CONFIG||null;
   const configured=!!(cfg&&typeof cfg==="object"&&typeof cfg.apiKey==="string"&&cfg.apiKey.length>10&&cfg.projectId&&!/INCOLLA/i.test(JSON.stringify(cfg)));
   const sdk=typeof window.firebase!=="undefined"&&typeof firebase.auth==="function"&&typeof firebase.firestore==="function";
@@ -2218,6 +2227,7 @@ const Cloud=(()=>{
      Arrivano allo Store solo le fotografie del server: quelle dalla memoria del telefono (fromCache) non
      cancellano la copia locale quando si apre l'app senza rete. */
   function db(){
+    if(PREVIEW) return Promise.resolve().then(()=>window.claude.use("db")).catch(()=>null);
     if(!fs||!user) return null;
     const col=c=>{ const ref=fs.collection(c); return {
       doc:id=>ref.doc(id),
@@ -2303,9 +2313,15 @@ const Cloud=(()=>{
   }
 
   /* ---------- avvio ---------- */
+  function enterPreview(){
+    PREVIEW=true; document.body.classList.add("preview"); document.title="Quaderno Anteprima"; start();
+  }
   function boot(ready){
     onReady=ready;
-    if(!configured){ gate("setup"); return }
+    if(inClaude()){ enterPreview(); return }
+    if(!configured){ gate("setup");
+      let n=0; const t=setInterval(()=>{ if(inClaude()){ clearInterval(t); enterPreview() } else if(++n>=15) clearInterval(t) },200); // Claude arrivato in ritardo
+      return }
     if(!sdk){ gate("nosdk"); return }
     init(); gate("loading");
     auth.onAuthStateChanged(async u=>{
@@ -2337,11 +2353,13 @@ const Cloud=(()=>{
     await u.reauthenticateWithCredential(firebase.auth.EmailAuthProvider.credential(u.email,cur));
     await u.updatePassword(next);
   }
-  return {boot,db,signOut,changePassword,errText,get email(){return user&&user.email||""},get configured(){return configured}};
+  return {boot,db,signOut,changePassword,errText,get email(){return user&&user.email||""},get configured(){return configured},get preview(){return PREVIEW}};
 })();
 
 /* ---------- pannello Dati e backup: account ---------- */
 function accountSectionHTML(){
+  if(Cloud.preview) return `<div class="section"><h3>Anteprima</h3>
+    <p class="dnote">Questa è l'anteprima su Claude: niente accesso, e i dati sono quelli di prova salvati in Claude. I dati degli allenatori su Firebase non vengono mai letti né modificati.</p></div>`;
   return `<div class="section"><h3>Account</h3>
     <p class="dnote">Sei entrato come <b>${esc(Cloud.email||"—")}</b>.</p>
     <div class="dbtns"><button class="btn ghost" data-chpw>${ico("key")}Cambia password</button><button class="btn ghost" data-logout style="color:var(--danger)">${ico("logout")}Esci</button></div></div>`;
@@ -2385,7 +2403,7 @@ function confirmSignOut(){
 }
 
 /* ---------- app installabile: salva l'app sul telefono per aprirla anche senza rete ---------- */
-if("serviceWorker" in navigator&&/^https?:$/.test(location.protocol)) addEventListener("load",()=>{ navigator.serviceWorker.register("sw.js").catch(()=>{}) });
+if("serviceWorker" in navigator&&/^https?:$/.test(location.protocol)) addEventListener("load",()=>{ if(!Cloud.preview) navigator.serviceWorker.register("sw.js").catch(()=>{}) });
 </script>
 <script>
 "use strict";
